@@ -1,0 +1,113 @@
+name: Auto-Resolve Merge Conflicts
+
+# Trigger on push to any non-main branch.
+# We intentionally do NOT rely solely on `pull_request` events because GitHub
+# cannot compute a merge commit for conflicting PRs, which causes it to
+# silently skip all pull_request-triggered workflows — the exact situation we
+# need to handle.
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+    types: [opened]
+
+concurrency:
+  group: resolve-conflicts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-conflicts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Detect whether the PR has merge conflicts ──────────────────
+      - name: Find open PR and check for conflicts
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ github.ref_name }}"
+
+          # Look up the open PR for this branch
+          PR_NUM=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$PR_NUM" ]; then
+            echo "No open PR for branch $BRANCH — skipping"
+            echo "has_conflicts=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "pr_number=$PR_NUM" >> $GITHUB_OUTPUT
+
+          BASE=$(gh pr view "$PR_NUM" --json baseRefName --jq '.baseRefName')
+          echo "base_ref=$BASE" >> $GITHUB_OUTPUT
+
+          # GitHub computes mergeability asynchronously — retry up to 3 times
+          for i in 1 2 3; do
+            STATUS=$(gh pr view "$PR_NUM" --json mergeable --jq '.mergeable')
+            if [ "$STATUS" = "CONFLICTING" ]; then
+              echo "has_conflicts=true" >> $GITHUB_OUTPUT
+              exit 0
+            elif [ "$STATUS" = "MERGEABLE" ]; then
+              echo "has_conflicts=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            sleep 5
+          done
+          # Still UNKNOWN after retries — skip
+          echo "has_conflicts=false" >> $GITHUB_OUTPUT
+
+      # ── Run Oz to resolve the conflicts ────────────────────────────
+      - uses: warpdotdev/oz-agent-action@v1
+        if: steps.check.outputs.has_conflicts == 'true'
+        with:
+          warp_api_key: ${{ secrets.WARP_API_KEY }}
+          skill: 'resolve-merge-conflicts'
+          profile: ${{ vars.WARP_AGENT_PROFILE || '' }}
+          prompt: |
+            PR #${{ steps.check.outputs.pr_number }} has merge conflicts.
+            Branch: ${{ github.ref_name }} → ${{ steps.check.outputs.base_ref }}
+
+            Steps:
+            1. Merge the base branch: git merge origin/${{ steps.check.outputs.base_ref }}
+            2. Use the resolve-merge-conflicts skill (.agents/skills/resolve-merge-conflicts/SKILL.md) to identify and resolve all conflicts
+            3. Validate the resolution: check for leftover conflict markers and run any
+               project-level checks (build, lint, type-check, tests) if they exist.
+            4. Commit and push the resolved branch
+            5. Comment on the PR with a detailed summary using gh pr comment. The comment must include:
+               - Which files had conflicts and how many hunks each had
+               - For each conflict, a one-sentence description of what changed on each side and how you resolved it
+               - Confirmation of any validation checks that passed after the resolution
+               - A note that the branch is ready to merge
+               Use this format:
+               ## Merge conflicts resolved automatically ✨
+               **Files affected:** <list>
+               ### Resolution summary
+               <per-file breakdown>
+               ### Validation
+               - ✅ No remaining conflict markers
+               - ✅ <any project checks that passed>
+               Branch is ready to merge.
+
+            Resolution rules — apply strictly in this order:
+            - SAFE to auto-resolve: both sides made purely additive changes to the same area
+              (e.g. both added different new entries to an enum, array, or import list).
+              Take both sets of additions.
+            - MUST defer to humans: one or both sides changed an existing value to a
+              different non-additive value (e.g. a constant, a function body, a config key).
+              Do NOT pick a side based on the PR description, commit message, or your own
+              judgment about which value "seems right". These are product or architectural
+              decisions that require a human.
+            - MUST defer to humans: the intent of either side is unclear from the diff alone.
+
+            When deferring, do NOT push. Comment on the PR explaining:
+            - Which files could not be resolved and why
+            - Exactly what each side changed (show the two values)
+            - Why this cannot be auto-resolved (it is a product/architectural decision)
+            - What question needs to be answered before this can be merged

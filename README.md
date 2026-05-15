@@ -32,19 +32,43 @@ To reset and run it again:
 ├── SKILL.md                                # Skill definition (workflow + commands)
 └── scripts/
     └── extract_conflict_context.py         # Python script for compact conflict extraction
+.github/workflows/
+└── auto-resolve-conflicts.yml              # GitHub Actions workflow — auto-resolves PR conflicts
 setup.sh                                    # Demo setup (creates conflicts to resolve)
 ```
 
 ## Install in your own project
 
-Copy the skill directory into any repo to give Oz the same capability there:
+Copy the skill directory and the workflow into any repo:
 
 ```bash
+# Skill (gives Oz the merge-conflict workflow)
 mkdir -p .agents/skills
 cp -r path/to/resolve-merge-conflicts/.agents/skills/resolve-merge-conflicts .agents/skills/
+
+# GitHub Actions workflow (auto-resolves conflicts on PRs)
+mkdir -p .github/workflows
+cp path/to/resolve-merge-conflicts/.github/workflows/auto-resolve-conflicts.yml .github/workflows/
 ```
 
-Once the skill is in your project's `.agents/skills/` directory, Oz will automatically use it whenever it encounters merge conflicts.
+The skill works immediately in Warp for local conflicts. The workflow also requires a `WARP_API_KEY` repo secret — see [CI/CD setup](#cicd-github-actions) below.
+
+## CI/CD: GitHub Actions
+
+The included workflow (`.github/workflows/auto-resolve-conflicts.yml`) runs Oz automatically when a PR develops merge conflicts.
+
+**How it works:**
+1. On every push to a non-main branch, the workflow checks if the branch's open PR has conflicts.
+2. If conflicts are detected, it launches an Oz agent that merges the base branch, resolves conflicts using the skill, validates the result, and pushes.
+3. Oz posts a detailed summary comment on the PR — listing affected files, how each conflict was resolved, and which checks passed.
+4. If a conflict requires a human decision (e.g. both sides changed a value differently), Oz defers and comments explaining what needs manual attention.
+
+**Setup:**
+1. Add your Warp API key as a repo secret named `WARP_API_KEY`.
+2. Optionally set a `WARP_AGENT_PROFILE` repo variable if you use a custom Oz profile.
+3. The workflow needs `contents: write` and `pull-requests: write` permissions (already configured).
+
+That's it — conflicts on PRs will be resolved automatically.
 
 ## How Oz uses the skill
 
